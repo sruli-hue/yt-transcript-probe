@@ -1,0 +1,67 @@
+name: reliability
+on:
+  workflow_dispatch:
+
+jobs:
+  rel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install -q -U yt-dlp
+
+      - name: bring up WARP
+        run: |
+          docker run -d --name warp -p 1080:1080 -e WARP_SLEEP=2 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            caomingjun/warp >/dev/null 2>&1
+          for i in $(seq 1 30); do curl -sf --max-time 5 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org >/dev/null && break; sleep 4; done
+          WIP=$(curl -s --socks5-hostname 127.0.0.1:1080 https://api.ipify.org)
+          echo "SHARD ${{ matrix.shard }} warp_ip=$WIP asn=$(curl -s https://ipinfo.io/$WIP/org)"
+
+      - name: "hard set: live, 7.6h, hebrew, arabic, long, short — captions through WARP"
+        continue-on-error: true
+        run: |
+          set +e
+          for entry in ucDetNtEjMU:LIVE-2.7h Eeswj9AjEKs:7.6h-Cohen To60lAmOxvU:15m-Booker xnFLRbsePP8:55m-Cassidy OCdrhALAAPM:HEBREW U6CQEx2tobY:ARABIC-96m; do
+            V="${entry%%:*}"; L="${entry##*:}"
+            rm -f s.*.vtt
+            OUT=$(timeout 240 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download \
+                  --write-auto-subs --write-subs --sub-langs "en.*,he.*,ar.*" --sub-format "vtt/best" \
+                  -o "s.%(ext)s" "https://www.youtube.com/watch?v=$V" 2>&1)
+            BYTES=$(cat s.*.vtt 2>/dev/null | wc -c)
+            if [ "$BYTES" -gt 200 ]; then
+              echo "  $L -> CAPTIONS OK ${BYTES}b | $(grep -h -m1 -A1 -- '-->' s.*.vtt | tail -1 | cut -c1-55)"
+            else
+              echo "  $L -> NO CAPTIONS | $(echo "$OUT" | grep -Ei 'error|not a bot|no subtitle|429' | head -1 | cut -c1-110)"
+            fi
+          done
+
+      - name: "burst: 12 sequential fetches through WARP (bursty-hour simulation)"
+        continue-on-error: true
+        run: |
+          set +e
+          OK=0; FAIL=0
+          for i in $(seq 1 12); do
+            R=$(timeout 120 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download --no-warnings \
+                --print "%(title).25s" "https://www.youtube.com/watch?v=To60lAmOxvU" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*) FAIL=$((FAIL+1)); echo "  $i BOT WALL" ;;
+              ERROR*)        FAIL=$((FAIL+1)); echo "  $i ERR $(echo "$R"|cut -c1-70)" ;;
+              *)             OK=$((OK+1));     echo "  $i ok" ;;
+            esac
+          done
+          echo "BURST RESULT shard=${{ matrix.shard }} ok=$OK fail=$FAIL"
+
+      - name: "audio through WARP (Whisper path) on a long video"
+        continue-on-error: true
+        run: |
+          set +e
+          timeout 400 yt-dlp --proxy socks5://127.0.0.1:1080 -f "bestaudio[ext=m4a]/bestaudio" \
+            --max-filesize 120M -o "aud.%(ext)s" "https://www.youtube.com/watch?v=xnFLRbsePP8" 2>&1 | tail -3
+          if [ -f aud.m4a ]; then echo "AUDIO OK $(wc -c <aud.m4a) bytes"; else echo "AUDIO FAILED"; fi
