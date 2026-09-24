@@ -1,0 +1,161 @@
+name: routes
+on:
+  workflow_dispatch:
+    inputs:
+      vid:
+        description: "YouTube video id"
+        default: "dQw4w9WgXcQ"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Identify runner egress IP
+        run: |
+          echo "=== WHO AM I ==="
+          IP=$(curl -s --max-time 15 https://api.ipify.org)
+          echo "egress IPv4: $IP"
+          curl -s --max-time 15 "https://ipinfo.io/$IP/json" || true
+          echo
+          echo "IPv6:"; curl -s -6 --max-time 10 https://api64.ipify.org || echo "(no v6)"
+
+      - name: Install tools
+        run: |
+          python -m pip install -q -U yt-dlp youtube-transcript-api
+          yt-dlp --version
+
+      - name: "T1  yt-dlp BARE (baseline: is the block real?)"
+        continue-on-error: true
+        run: |
+          set +e
+          VID="${{ github.event.inputs.vid }}"
+          yt-dlp --skip-download --list-subs "https://www.youtube.com/watch?v=$VID" 2>&1 | tail -25
+          echo "EXIT=$?"
+
+      - name: "T2  yt-dlp player_client variants"
+        continue-on-error: true
+        run: |
+          set +e
+          VID="${{ github.event.inputs.vid }}"
+          for C in default tv tv_simply ios android android_vr web_safari web_embedded mweb; do
+            echo "----- player_client=$C -----"
+            timeout 90 yt-dlp --skip-download --no-warnings \
+              --extractor-args "youtube:player_client=$C" \
+              --print "OK %(title).60s subs=%(subtitles.keys)s auto=%(automatic_captions.keys)s" \
+              "https://www.youtube.com/watch?v=$VID" 2>&1 | head -6
+          done
+
+      - name: "T3  bgutil PO-token provider + yt-dlp"
+        continue-on-error: true
+        run: |
+          set +e
+          VID="${{ github.event.inputs.vid }}"
+          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider 2>&1 | tail -2
+          python -m pip install -q bgutil-ytdlp-pot-provider
+          for i in $(seq 1 20); do curl -sf --max-time 3 http://127.0.0.1:4416/ping >/dev/null && break; sleep 3; done
+          echo "provider ping:"; curl -s --max-time 5 http://127.0.0.1:4416/ping; echo
+          echo "----- yt-dlp WITH pot provider -----"
+          timeout 180 yt-dlp --skip-download -v \
+            --print "OK %(title).60s subs=%(subtitles.keys)s auto=%(automatic_captions.keys)s" \
+            "https://www.youtube.com/watch?v=$VID" 2>&1 | grep -Ei "pot|OK |sign in|error|forbidden|bot" | head -30
+          echo "----- actually download a subtitle file -----"
+          timeout 180 yt-dlp --skip-download --write-auto-subs --write-subs --sub-langs "en.*" \
+            --sub-format "vtt/best" -o "t3.%(ext)s" \
+            "https://www.youtube.com/watch?v=$VID" 2>&1 | tail -8
+          ls -la t3* 2>/dev/null && head -c 400 t3*.vtt 2>/dev/null
+          docker logs bgutil 2>&1 | tail -15
+
+      - name: "T4  Invidious public instances"
+        continue-on-error: true
+        run: |
+          set +e
+          VID="${{ github.event.inputs.vid }}"
+          curl -s --max-time 20 "https://api.invidious.io/instances.json" -o inv.json
+          python - <<'PY'
+          import json,urllib.request,os
+          vid=os.environ.get("VID","dQw4w9WgXcQ")
+          try: inst=json.load(open("inv.json"))
+          except Exception as e: inst=[]; print("instance list failed",e)
+          hosts=[n for n,i in inst if i.get("type")=="https"]
+          print("https instances:",hosts)
+          for h in hosts:
+              for path in (f"/api/v1/captions/{vid}",):
+                  u=f"https://{h}{path}"
+                  try:
+                      r=urllib.request.urlopen(urllib.request.Request(u,headers={"User-Agent":"Mozilla/5.0"}),timeout=20)
+                      b=r.read()[:200]
+                      print(f"  {h} -> HTTP {r.status} :: {b[:160]!r}")
+                  except Exception as e:
+                      print(f"  {h} -> FAIL {type(e).__name__}: {str(e)[:120]}")
+          PY
+        env:
+          VID: ${{ github.event.inputs.vid }}
+
+      - name: "T5  Piped public instances"
+        continue-on-error: true
+        run: |
+          set +e
+          python - <<'PY'
+          import json,urllib.request,os
+          vid=os.environ.get("VID","dQw4w9WgXcQ")
+          hosts=["api.piped.private.coffee","pipedapi.kavin.rocks","pipedapi.adminforge.de",
+                 "pipedapi.leptons.xyz","pipedapi.drgns.space","api.piped.yt",
+                 "pipedapi.ducks.party","piped-api.codespace.cz","pipedapi.reallyaweso.me",
+                 "pipedapi.nosebs.ru","pipedapi.phoenixthrush.com"]
+          for h in hosts:
+              u=f"https://{h}/streams/{vid}"
+              try:
+                  r=urllib.request.urlopen(urllib.request.Request(u,headers={"User-Agent":"Mozilla/5.0"}),timeout=25)
+                  d=json.loads(r.read())
+                  subs=d.get("subtitles") or []
+                  print(f"  {h} -> HTTP {r.status} title={str(d.get('title'))[:40]!r} subtitles={len(subs)}")
+                  if subs:
+                      en=[s for s in subs if str(s.get('code','')).startswith('en')]
+                      tgt=(en or subs)[0]
+                      try:
+                          rr=urllib.request.urlopen(urllib.request.Request(tgt['url'],headers={"User-Agent":"Mozilla/5.0"}),timeout=30)
+                          bb=rr.read()
+                          print(f"      CAPTION FETCH OK {rr.status} bytes={len(bb)} :: {bb[:120]!r}")
+                      except Exception as e:
+                          print(f"      CAPTION FETCH FAIL {type(e).__name__}: {str(e)[:120]}")
+              except Exception as e:
+                  print(f"  {h} -> FAIL {type(e).__name__}: {str(e)[:110]}")
+          PY
+        env:
+          VID: ${{ github.event.inputs.vid }}
+
+      - name: "T6  youtube-transcript-api (direct innertube)"
+        continue-on-error: true
+        run: |
+          set +e
+          python - <<'PY'
+          import os
+          vid=os.environ.get("VID","dQw4w9WgXcQ")
+          try:
+              from youtube_transcript_api import YouTubeTranscriptApi
+              try:
+                  api=YouTubeTranscriptApi(); t=api.fetch(vid)
+                  print("OK new-api segments:",len(t.to_raw_data()), t.to_raw_data()[:2])
+              except AttributeError:
+                  t=YouTubeTranscriptApi.get_transcript(vid)
+                  print("OK old-api segments:",len(t), t[:2])
+          except Exception as e:
+              print("FAIL",type(e).__name__,str(e)[:600])
+          PY
+        env:
+          VID: ${{ github.event.inputs.vid }}
+
+      - name: "T7  direct YouTube reachability (is it IP or endpoint?)"
+        continue-on-error: true
+        run: |
+          set +e
+          VID="${{ github.event.inputs.vid }}"
+          echo "--- plain watch page ---"
+          curl -s -o wp.html -w "HTTP %{http_code} bytes=%{size_download}\n" --max-time 20 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36" \
+            "https://www.youtube.com/watch?v=$VID"
+          grep -o "Sign in to confirm\|consent.youtube\|captionTracks" wp.html | sort | uniq -c
