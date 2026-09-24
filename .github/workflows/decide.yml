@@ -1,0 +1,140 @@
+name: decide
+on:
+  workflow_dispatch:
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: |
+          python -m pip install -q -U yt-dlp youtube-transcript-api
+          echo "yt-dlp $(yt-dlp --version)"
+          IP=$(curl -s https://api.ipify.org); echo "SHARD ${{ matrix.shard }} EGRESS=$IP"
+
+      # ---------- A: is the famous video a false positive? ----------
+      - name: "A  control: famous video vs real video, same IP, same second"
+        continue-on-error: true
+        run: |
+          set +e
+          for V in dQw4w9WgXcQ To60lAmOxvU xnFLRbsePP8 OCdrhALAAPM; do
+            R=$(timeout 90 yt-dlp --skip-download --no-warnings --print "%(title).40s" \
+                "https://www.youtube.com/watch?v=$V" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*) echo "  $V -> BOT WALL" ;;
+              ERROR*)        echo "  $V -> ERROR: $(echo "$R" | cut -c1-80)" ;;
+              *)             echo "  $V -> OK: $R" ;;
+            esac
+          done
+
+      # ---------- B: does a PO token fix real videos? ----------
+      - name: "B  bgutil PO-token provider vs REAL videos"
+        continue-on-error: true
+        run: |
+          set +e
+          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider >/dev/null 2>&1
+          python -m pip install -q bgutil-ytdlp-pot-provider
+          for i in $(seq 1 25); do curl -sf --max-time 3 http://127.0.0.1:4416/ping >/dev/null && break; sleep 3; done
+          echo "provider: $(curl -s --max-time 5 http://127.0.0.1:4416/ping)"
+          for V in dQw4w9WgXcQ To60lAmOxvU xnFLRbsePP8; do
+            R=$(timeout 150 yt-dlp --skip-download --no-warnings --print "%(title).40s" \
+                "https://www.youtube.com/watch?v=$V" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*) echo "  POT $V -> BOT WALL" ;;
+              ERROR*)        echo "  POT $V -> ERROR: $(echo "$R" | cut -c1-80)" ;;
+              *)             echo "  POT $V -> OK: $R" ;;
+            esac
+          done
+          echo "--- POT + real subtitle download (To60lAmOxvU) ---"
+          timeout 180 yt-dlp --skip-download --write-auto-subs --write-subs --sub-langs "en.*" \
+            --sub-format "vtt/best" -o "p.%(ext)s" \
+            "https://www.youtube.com/watch?v=To60lAmOxvU" 2>&1 | grep -Ei "error|not a bot|writing video subtitles" | head -4
+          for f in p.*.vtt; do [ -f "$f" ] && echo "   FILE $f $(wc -c <"$f") bytes"; done
+          ls p.*.vtt >/dev/null 2>&1 || echo "   *** NO FILE ***"
+
+      # ---------- C: Cloudflare WARP (free) vs real videos ----------
+      - name: "C  Cloudflare WARP egress vs REAL videos"
+        continue-on-error: true
+        run: |
+          set +e
+          docker run -d --name warp -p 1080:1080 -e WARP_SLEEP=2 --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            caomingjun/warp >/dev/null 2>&1
+          for i in $(seq 1 30); do curl -sf --max-time 5 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org >/dev/null && break; sleep 4; done
+          WIP=$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org)
+          echo "WARP egress: $WIP ($(curl -s "https://ipinfo.io/$WIP/org"))"
+          for V in dQw4w9WgXcQ To60lAmOxvU xnFLRbsePP8 OCdrhALAAPM; do
+            R=$(timeout 150 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download --no-warnings \
+                --print "%(title).40s" "https://www.youtube.com/watch?v=$V" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*) echo "  WARP $V -> BOT WALL" ;;
+              ERROR*)        echo "  WARP $V -> ERROR: $(echo "$R" | cut -c1-80)" ;;
+              *)             echo "  WARP $V -> OK: $R" ;;
+            esac
+          done
+          echo "--- WARP + real subtitle download ---"
+          timeout 240 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download \
+            --write-auto-subs --write-subs --sub-langs "en.*" --sub-format "vtt/best" \
+            -o "c.%(ext)s" "https://www.youtube.com/watch?v=To60lAmOxvU" 2>&1 | grep -Ei "error|not a bot|writing video subtitles" | head -4
+          for f in c.*.vtt; do [ -f "$f" ] && echo "   FILE $f $(wc -c <"$f") bytes | $(grep -m1 -A1 -- '-->' "$f" | tail -1 | cut -c1-70)"; done
+          ls c.*.vtt >/dev/null 2>&1 || echo "   *** NO FILE ***"
+          echo "--- WARP + audio (Whisper path) ---"
+          timeout 300 yt-dlp --proxy socks5://127.0.0.1:1080 -f "bestaudio[ext=m4a]/bestaudio" \
+            --max-filesize 80M -o "ca.%(ext)s" "https://www.youtube.com/watch?v=To60lAmOxvU" 2>&1 | grep -Ei "error|not a bot|Destination|100%" | head -4
+          ls -la ca.* 2>/dev/null || echo "   *** NO AUDIO ***"
+
+      # ---------- D: WARP + POT together ----------
+      - name: "D  WARP + PO token combined"
+        continue-on-error: true
+        run: |
+          set +e
+          for V in To60lAmOxvU xnFLRbsePP8; do
+            R=$(timeout 180 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download --no-warnings \
+                --print "%(title).40s" "https://www.youtube.com/watch?v=$V" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*) echo "  WARP+POT $V -> BOT WALL" ;;
+              ERROR*)        echo "  WARP+POT $V -> ERROR: $(echo "$R" | cut -c1-80)" ;;
+              *)             echo "  WARP+POT $V -> OK: $R" ;;
+            esac
+          done
+
+      # ---------- E: Invidious nadeko + youtube-transcript-api on REAL videos ----------
+      - name: "E  Invidious inv.nadeko.net + youtube-transcript-api, REAL videos"
+        continue-on-error: true
+        run: |
+          set +e
+          python - <<'PY'
+          import json,urllib.request,urllib.parse
+          vids={"dQw4w9WgXcQ":"control-famous","To60lAmOxvU":"15m Booker","xnFLRbsePP8":"55m Cassidy",
+                "OCdrhALAAPM":"Hebrew","U6CQEx2tobY":"Arabic 96m","Eeswj9AjEKs":"7.6h Cohen","ucDetNtEjMU":"LIVE"}
+          H="inv.nadeko.net"
+          print("### INVIDIOUS", H)
+          for v,lbl in vids.items():
+              try:
+                  r=urllib.request.urlopen(urllib.request.Request(f"https://{H}/api/v1/captions/{v}",
+                      headers={"User-Agent":"Mozilla/5.0"}),timeout=30)
+                  d=json.loads(r.read()); caps=d.get("captions") or []
+                  print(f"  {lbl:15} list OK n={len(caps)} {[c.get('languageCode') for c in caps][:5]}")
+                  if caps:
+                      cu=f"https://{H}{caps[0]['url']}"
+                      rr=urllib.request.urlopen(urllib.request.Request(cu,headers={"User-Agent":"Mozilla/5.0"}),timeout=40)
+                      body=rr.read()
+                      print(f"  {'':15} TEXT OK {rr.status} bytes={len(body)} :: {body[:100]!r}")
+              except Exception as e:
+                  print(f"  {lbl:15} FAIL {type(e).__name__}: {str(e)[:80]}")
+          print()
+          print("### youtube-transcript-api (direct innertube)")
+          from youtube_transcript_api import YouTubeTranscriptApi
+          for v,lbl in vids.items():
+              try:
+                  api=YouTubeTranscriptApi(); t=api.fetch(v).to_raw_data()
+                  print(f"  {lbl:15} OK segments={len(t)} :: {str(t[:1])[:90]}")
+              except Exception as e:
+                  print(f"  {lbl:15} FAIL {type(e).__name__}: {str(e)[:110]}")
+          PY
