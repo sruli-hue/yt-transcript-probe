@@ -1,0 +1,29 @@
+name: probe2
+on:
+  workflow_dispatch:
+jobs:
+  probe2:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install
+        run: |
+          pip install -q "yt-dlp[default]" youtube-transcript-api
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - name: run probe2
+        env:
+          PROBE_ENV: ACTIONS_replica_${{ matrix.replica }}
+          PROBE_OUT: ${{ github.workspace }}/probe2_${{ matrix.replica }}.json
+        run: python probe2.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe2-${{ matrix.replica }}
+          path: probe2_*.json
