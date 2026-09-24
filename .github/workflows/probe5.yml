@@ -1,0 +1,51 @@
+name: probe5
+on:
+  workflow_dispatch:
+jobs:
+  warp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: |
+          pip install -q "yt-dlp[default]"
+          sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools ffmpeg
+      - name: bring up WARP from pre-registered profile
+        env:
+          WARP_CONF: ${{ secrets.WARP_CONF }}
+        run: |
+          echo "IP before WARP: $(curl -s --max-time 20 https://api.ipify.org)"
+          printf '%s\n' "$WARP_CONF" | sudo tee /etc/wireguard/warp.conf >/dev/null
+          sudo chmod 600 /etc/wireguard/warp.conf
+          sudo wg-quick up warp || { echo "WG_UP_FAILED"; exit 0; }
+          sleep 5
+          echo "IP after WARP:  $(curl -s --max-time 25 https://api.ipify.org)"
+          sudo wg show | head -20
+      - name: yt-dlp through WARP on REAL videos
+        run: |
+          set +e
+          for V in Xi0fKbOz9ZA vAsA_t_5a-I 02Ns6EbCplY; do
+            rm -rf /tmp/o && mkdir -p /tmp/o
+            yt-dlp --skip-download --write-auto-subs --write-subs \
+                   --sub-langs "en.*,en" --sub-format vtt/best --no-warnings --no-playlist \
+                   -o "/tmp/o/%(id)s.%(ext)s" "https://www.youtube.com/watch?v=$V" 2>/tmp/e.txt
+            F=$(ls /tmp/o/*.vtt 2>/dev/null | head -1)
+            if [ -n "$F" ]; then echo "PASS $V $(wc -c <"$F") bytes"
+            elif grep -q "not a bot" /tmp/e.txt; then echo "FAIL $V BOT-WALL"
+            else echo "FAIL $V $(grep ERROR /tmp/e.txt | head -1 | cut -c1-90)"; fi
+            sleep 4
+          done
+      - name: audio through WARP (caption-less hearing, Whisper path)
+        run: |
+          set +e
+          rm -rf /tmp/a && mkdir -p /tmp/a
+          time yt-dlp -f bestaudio/best --no-warnings --no-playlist \
+            --download-sections "*0-300" -x --audio-format mp3 --audio-quality 9 \
+            --postprocessor-args "ffmpeg:-ac 1 -ar 16000" \
+            -o "/tmp/a/a.%(ext)s" "https://www.youtube.com/watch?v=dBDww47UKSM" 2>/tmp/ea.txt
+          F=$(ls /tmp/a/a.mp3 2>/dev/null | head -1)
+          if [ -n "$F" ]; then
+            S=$(stat -c%s "$F"); echo "PASS audio 5min slice = $((S/1000))KB -> full 71min ~ $((S*71/5/1000000))MB (Groq free cap 25MB)"
+          elif grep -q "not a bot" /tmp/ea.txt; then echo "FAIL audio BOT-WALL"
+          else echo "FAIL audio $(grep ERROR /tmp/ea.txt | head -1 | cut -c1-90)"; fi
