@@ -1,0 +1,45 @@
+name: reroll
+on:
+  workflow_dispatch:
+
+jobs:
+  reroll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install -q -U yt-dlp
+
+      - name: "re-roll loop: keep restarting WARP until an exit IP works"
+        continue-on-error: true
+        run: |
+          set +e
+          VID=To60lAmOxvU
+          WIN=0
+          for ATTEMPT in 1 2 3 4 5; do
+            docker rm -f warp >/dev/null 2>&1
+            docker run -d --name warp -p 1080:1080 -e WARP_SLEEP=2 --cap-add NET_ADMIN \
+              --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+              caomingjun/warp >/dev/null 2>&1
+            for i in $(seq 1 30); do curl -sf --max-time 5 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org >/dev/null && break; sleep 3; done
+            WIP=$(curl -s --max-time 15 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org)
+            R=$(timeout 120 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download --no-warnings \
+                --print "%(title).30s" "https://www.youtube.com/watch?v=$VID" 2>&1 | head -1)
+            case "$R" in
+              *"not a bot"*|*"429"*|ERROR*) echo "attempt $ATTEMPT ip=$WIP -> BLOCKED ($(echo "$R" | cut -c1-60))" ;;
+              *) echo "attempt $ATTEMPT ip=$WIP -> WORKS: $R"; WIN=$ATTEMPT; break ;;
+            esac
+          done
+          echo "RESULT shard=${{ matrix.shard }} first_working_attempt=$WIN"
+          if [ "$WIN" != "0" ]; then
+            timeout 200 yt-dlp --proxy socks5://127.0.0.1:1080 --skip-download --write-auto-subs \
+              --write-subs --sub-langs "en.*" --sub-format "vtt/best" -o "r.%(ext)s" \
+              "https://www.youtube.com/watch?v=$VID" >/dev/null 2>&1
+            B=$(cat r.*.vtt 2>/dev/null | wc -c)
+            echo "CAPTION BYTES after re-roll: $B"
+          fi
