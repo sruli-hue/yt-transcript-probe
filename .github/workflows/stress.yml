@@ -1,0 +1,67 @@
+name: stress
+on:
+  workflow_dispatch:
+
+jobs:
+  stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [a, b, c, d]
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install -q -U yt-dlp
+
+      - name: egress
+        run: |
+          IP=$(curl -s --max-time 15 https://api.ipify.org)
+          echo "SHARD=${{ matrix.shard }} EGRESS=$IP"
+          curl -s --max-time 15 "https://ipinfo.io/$IP/json" | python -c "import json,sys; d=json.load(sys.stdin); print('ASN:',d.get('org'),'|',d.get('city'),d.get('region'))"
+
+      - name: "real videos: caption listing + real download"
+        continue-on-error: true
+        run: |
+          set +e
+          # id:label  (real JI-shaped content)
+          VIDS="ucDetNtEjMU:LIVE-2.7h-hearing Eeswj9AjEKs:7.6h-Cohen-hearing To60lAmOxvU:15m-Booker-Patel xnFLRbsePP8:55m-Cassidy-interview OCdrhALAAPM:15m-HEBREW U6CQEx2tobY:96m-ARABIC"
+          for entry in $VIDS; do
+            VID="${entry%%:*}"; LBL="${entry##*:}"
+            echo "================ $LBL ($VID) ================"
+            OUT=$(timeout 120 yt-dlp --skip-download --no-warnings \
+              --print "META|%(title).45s|live=%(is_live)s|dur=%(duration)s|subs=%(subtitles.keys)s|auto_n=%(automatic_captions.keys)s" \
+              "https://www.youtube.com/watch?v=$VID" 2>&1 | head -4)
+            echo "$OUT" | cut -c1-260
+            # serialize: exactly one language, avoids the 429 seen on parallel sub fetches
+            timeout 150 yt-dlp --skip-download --write-auto-subs --write-subs \
+              --sub-langs "en.*,he.*,ar.*" --sub-format "vtt/best" \
+              -o "$VID.%(ext)s" "https://www.youtube.com/watch?v=$VID" 2>&1 | grep -Ei "error|sign in|bot|429|writing video subtitles" | head -5
+            for f in $VID*.vtt; do
+              [ -f "$f" ] && echo "   FILE $f $(wc -c <"$f") bytes | first cue: $(grep -m1 -A1 '\-\->' "$f" | tail -1 | cut -c1-60)"
+            done
+            ls $VID*.vtt >/dev/null 2>&1 || echo "   *** NO SUBTITLE FILE ***"
+            sleep 3
+          done
+
+      - name: "audio download path (what Whisper would need)"
+        continue-on-error: true
+        run: |
+          set +e
+          for VID in To60lAmOxvU OCdrhALAAPM; do
+            echo "===== audio $VID ====="
+            timeout 300 yt-dlp -f "bestaudio[ext=m4a]/bestaudio" --max-filesize 80M \
+              -o "a_$VID.%(ext)s" "https://www.youtube.com/watch?v=$VID" 2>&1 | grep -Ei "error|sign in|bot|429|100%|Destination" | head -6
+            ls -la a_$VID.* 2>/dev/null || echo "   *** NO AUDIO ***"
+          done
+
+      - name: "burst: 8 rapid requests (mimics several links in an hour)"
+        continue-on-error: true
+        run: |
+          set +e
+          for i in $(seq 1 8); do
+            R=$(timeout 60 yt-dlp --skip-download --no-warnings --print "%(title).25s" \
+                 "https://www.youtube.com/watch?v=To60lAmOxvU" 2>&1 | head -2 | tr '\n' ' ')
+            echo "burst $i: $R"
+          done
